@@ -34,6 +34,72 @@ import yaml  # noqa: F401
 from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
+DROP_LINE = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_IMG = {"DUP_IMAGE_EXACT", "DUP_IMAGE_NEAR", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+
+def _clip_line(text: str) -> str | None:
+    cls_id, x, y, w, h = parse_yolo_line(text)
+    x1, y1 = max(0.0, min(1.0, x - w / 2)), max(0.0, min(1.0, y - h / 2))
+    x2, y2 = max(0.0, min(1.0, x + w / 2)), max(0.0, min(1.0, y + h / 2))
+    nw, nh = x2 - x1, y2 - y1
+    if nw <= 0 or nh <= 0:
+        return None
+    return f"{cls_id} {(x1 + x2) / 2:.6f} {(y1 + y2) / 2:.6f} {nw:.6f} {nh:.6f}"
+
+
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    fixes = []
+    removed_imgs = set()
+    by_file: dict[str, dict[int, str]] = defaultdict(dict)
+    renamed = False
+
+    for i in issues:
+        if i.severity != ERROR:
+            continue
+        if i.code in REMOVE_IMG and i.image not in removed_imgs:
+            ip, lp = ds.image_path(i.image), ds.label_path(i.image)
+            if ip and ip.exists():
+                ip.unlink()
+            if lp.exists():
+                lp.unlink()
+            removed_imgs.add(i.image)
+            fixes.append(dict(image=i.image, line="", action="remove_image", before=i.code, after="deleted"))
+        elif i.code == "BAD_CLASS_NAME" and ds.yaml_path.exists() and not renamed:
+            d = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+            before = str(d.get("names"))
+            d["names"] = {idx: name for idx, name in enumerate(cfg["classes"])}
+            ds.yaml_path.write_text(yaml.safe_dump(d, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            renamed = True
+            fixes.append(dict(image="data.yaml", line="", action="rename_classes", before=before, after=str(d["names"])))
+        elif i.code == "MISSING_LABEL_FILE":
+            fixes.append(dict(image=i.image, line="", action="needs_label", before="(không có file)", after="chuyển người gán"))
+        elif i.code in DROP_LINE and i.line:
+            by_file[i.image][i.line] = "drop"
+        elif i.code == "BOX_OUT_OF_IMAGE" and i.line:
+            by_file[i.image].setdefault(i.line, "clip")
+
+    for stem, actions in sorted(by_file.items()):
+        if stem in removed_imgs:
+            continue
+        lp = ds.label_path(stem)
+        if not lp.exists():
+            continue
+        raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+        kept = []
+        for lineno, raw in enumerate(raw_lines, 1):
+            act = actions.get(lineno)
+            if act == "drop":
+                fixes.append(dict(image=stem, line=lineno, action="drop_line", before=raw, after=""))
+            elif act == "clip":
+                clipped = _clip_line(raw)
+                if clipped is None:
+                    fixes.append(dict(image=stem, line=lineno, action="drop_line", before=raw, after=""))
+                else:
+                    kept.append(clipped)
+                    fixes.append(dict(image=stem, line=lineno, action="clip_box", before=raw, after=clipped))
+            else:
+                kept.append(raw)
+        lp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+    return fixes
